@@ -1,0 +1,89 @@
+# TASK
+Create a single, self-contained PowerShell audit script for ONE specific CIS
+benchmark version: **CIS Microsoft Windows Server [2022 | 2025] Benchmark**,
+targeting the **Domain Controller** profile. The script is NOT dynamic — all
+check data is hardcoded into the script. I will attach the official CIS
+benchmark PDF; extract everything from that PDF, not from your training data.
+
+# CRITICAL CONSTRAINTS
+1. READ-ONLY. The script must only read system state. It may use ONLY:
+   - Get-ItemProperty (registry reads)
+   - secedit /export (NEVER /configure or /import)
+   - auditpol /get (NEVER /set)
+   - Get-CimInstance (host/role info)
+   The only writes permitted are: creating the output report folder, and a
+   temp file for the secedit export that is deleted after reading. No
+   Set-ItemProperty, New-ItemProperty, Remove-Item (except that temp file),
+   reg add/delete, Set-Service, or GPO cmdlets anywhere.
+
+2. NO external dependencies on the target server: no PDF, no Microsoft Word,
+   no third-party tools, no internet. All check data is baked into the script.
+
+3. ACCURACY OVER COVERAGE. Do not guess registry value names or expected
+   values from memory. Extract each one from the attached PDF's "Audit:"
+   section. The CIS PDF wraps long registry paths and value names across
+   lines — reassemble them carefully (e.g. a path segment like "Windows NT"
+   legitimately contains a space; a value name split as "ConsentPromptB" +
+   "ehaviorAdmin" must be rejoined to "ConsentPromptBehaviorAdmin"). If you
+   cannot confidently determine a value name or expected value, DO NOT invent
+   one — classify that recommendation as "Needs Review" and include its
+   benchmark page number so I can verify it manually.
+
+# SCOPE
+Include every recommendation that applies to the Domain Controller profile.
+Exclude Member-Server-only recommendations (those marked "(MS only)", or whose
+Profile Applicability lists only "Member Server" with no "Domain Controller").
+Include "(DC only)" items and items with no role marker.
+
+# ENGINES — route each recommendation to the correct check method:
+- Registry (HKLM)  → most of sections 2.3, 9, 18 (Get-ItemProperty)
+- Registry (HKCU)  → section 19 / per-user policies (read current-user hive)
+- secedit          → section 1 (password/lockout: map titles to INF keys like
+                     PasswordHistorySize, MaximumPasswordAge, LockoutBadCount…)
+- secedit (URA)    → section 2.2 User Rights (map titles to privilege constants
+                     like SeNetworkLogonRight, SeDenyInteractiveLogonRight…).
+                     Report the assigned accounts and mark "Needs Review" — do
+                     NOT auto-resolve SID-to-name, which causes false results.
+- auditpol         → section 17 Advanced Audit Policy (subcategory + Success/
+                     Failure/both)
+- Needs Review     → multi-string values, special controls, or anything you
+                     can't confidently automate
+
+# REGISTRY COMPARISON OPERATORS to support:
+eq (exact), ge ("N or more"), le ("N or fewer"), le_not0 ("N or fewer but not
+0"), in (list like "1 or 2"), between ("between 5 and 14"), absent ("a value
+does not exist"). Normalize hive prefixes (HKEY_LOCAL_MACHINE → HKLM, etc.).
+
+# SCRIPT STRUCTURE
+- Comment-based help header (.SYNOPSIS/.DESCRIPTION/.NOTES) stating it is
+  read-only and listing requirements (run elevated; PowerShell 5.1+).
+- Hardcoded check tables as arrays of hashtables, one array per engine, each
+  entry carrying: Id, Title, the engine-specific fields, Expected value, and
+  the benchmark Page number.
+- Read-only engine functions (registry/secedit/auditpol) as shown above.
+- A self-audit transcript log that records every action taken (every path
+  read, actual vs expected value, and verdict), proving the read-only claim.
+- Outputs to a folder on the Desktop: a CSV report, a color-coded HTML report
+  (green=Configured, red=Not Configured, amber=Needs Review, with the
+  benchmark page number shown on each row), and the transcript log.
+- Console summary: counts of Configured / Not Configured / Needs Review and a
+  compliance % of assessable checks.
+
+# OUTPUT FORMAT
+- Provide the complete .ps1 as a single code block.
+- Before the script, give a short coverage summary: how many recommendations
+  you found for the DC profile, how many are auto-checked vs flagged Needs
+  Review, and a list of the Needs-Review IDs with their page numbers.
+- After the script, state explicitly which value names or expected values you
+  were unsure about so I know what to verify against the PDF.
+
+# VALIDATION
+Ensure the script is syntactically valid PowerShell: balanced braces/parens,
+single-quotes inside strings escaped as '' , and every check-table array
+opened with @( and closed with ). Do not include any command that modifies
+system state.
+
+# REMINDERS
+- Tell me to run it elevated on the DC: 
+  powershell -ExecutionPolicy Bypass -File .\<scriptname>.ps1
+- Note that I should test it on one non-production DC first.
