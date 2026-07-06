@@ -223,6 +223,12 @@ try {
     Assert-True ($global:CallCount -eq 2) "called Invoke-RestMethod twice (was $($global:CallCount))"
 
 }
+catch {
+    $script:TestFailures++
+    Write-Host "`n[FATAL] Test run aborted before completing - this is NOT a pass:" -ForegroundColor Red
+    Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "  Check that Send-Mail.psm1 actually exists next to this test script." -ForegroundColor Yellow
+}
 finally {
     # Always clean up the shadow functions so they don't leak into the
     # rest of your session and silently break other scripts.
