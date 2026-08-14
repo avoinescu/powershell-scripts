@@ -429,6 +429,15 @@ function Load-Cache {
     return $cache
 }
  
+function Format-Duration {
+    param([double]$Seconds)
+    if ($Seconds -lt 0) { return "calculating..." }
+    $ts = [TimeSpan]::FromSeconds($Seconds)
+    if ($ts.TotalHours -ge 1) { return "{0}h {1}m" -f [int]$ts.TotalHours, $ts.Minutes }
+    elseif ($ts.TotalMinutes -ge 1) { return "{0}m {1}s" -f [int]$ts.TotalMinutes, $ts.Seconds }
+    else { return "{0}s" -f [int]$ts.TotalSeconds }
+}
+ 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -471,6 +480,19 @@ $i          = 0
 $fullyOk    = 0
 $withErrors = 0
  
+$totalToProcess = 0
+foreach ($row in $inputRows) {
+    $l = $row.$LoginColumnName
+    if ([string]::IsNullOrWhiteSpace($l)) { continue }
+    if ($processedLogins.ContainsKey($l)) { continue }
+    $totalToProcess++
+}
+$runStartTime = Get-Date
+$doneThisRun  = 0
+if ($totalToProcess -gt 0) {
+    Write-Host "Rows to process this run: $totalToProcess (of $total total)" -ForegroundColor Cyan
+}
+ 
 foreach ($row in $inputRows) {
     $i++
     $login = $row.$LoginColumnName
@@ -478,9 +500,22 @@ foreach ($row in $inputRows) {
     if ([string]::IsNullOrWhiteSpace($login)) { continue }
     if ($processedLogins.ContainsKey($login)) { continue }
  
-    Write-Progress -Activity "Resolving Okta manager chain" `
-        -Status "$i / $total : $login" `
-        -PercentComplete ([Math]::Min(100, ($i / $total) * 100))
+    $etaSeconds = -1
+    $avgSecondsPerRow = 0
+    if ($doneThisRun -gt 0) {
+        $elapsedSeconds   = ((Get-Date) - $runStartTime).TotalSeconds
+        $avgSecondsPerRow = $elapsedSeconds / $doneThisRun
+        $remaining        = [Math]::Max(0, $totalToProcess - $doneThisRun)
+        $etaSeconds        = [Math]::Max(0, [Math]::Round($avgSecondsPerRow * $remaining))
+    }
+ 
+    $progressParams = @{
+        Activity        = "Resolving Okta manager chain"
+        Status          = "$doneThisRun / $totalToProcess this run : $login"
+        PercentComplete = if ($totalToProcess -gt 0) { [Math]::Min(100, ($doneThisRun / $totalToProcess) * 100) } else { 0 }
+    }
+    if ($etaSeconds -ge 0) { $progressParams.SecondsRemaining = $etaSeconds }
+    Write-Progress @progressParams
  
     $outRow = [ordered]@{
         Login                              = $login
@@ -572,6 +607,12 @@ foreach ($row in $inputRows) {
     }
  
     [PSCustomObject]$outRow | Export-Csv -Path $OutputCsvPath -Delimiter $Delimiter -Append -NoTypeInformation
+    $doneThisRun++
+ 
+    if ($doneThisRun % 25 -eq 0) {
+        Write-Host ("  {0}/{1} done this run | avg {2:N2}s/row | ETA {3}" -f `
+            $doneThisRun, $totalToProcess, $avgSecondsPerRow, (Format-Duration $etaSeconds)) -ForegroundColor DarkGray
+    }
  
     if ($i % 100 -eq 0) {
         Save-Cache -Cache $cache -Path $CachePath
@@ -587,4 +628,3 @@ Write-Host "  Fully resolved (manager + skip-level manager): $fullyOk"
 Write-Host "  Rows with at least one error: $withErrors"
 Write-Host "  Output: $OutputCsvPath"
 Write-Host "  Cache:  $CachePath (safe to delete once you're done re-running)"
- 
