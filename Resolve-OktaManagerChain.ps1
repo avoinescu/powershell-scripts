@@ -89,6 +89,9 @@ param(
 
     [string]$LoginColumnName = "login",
 
+    # Swiss/German-locale Excel exports use ";" not ",". Set to "," if your file is US-style.
+    [string]$Delimiter = ";",
+
     [string]$CachePath = ".\okta_manager_cache.json",
 
     [int]$MaxRetries = 5,
@@ -316,40 +319,78 @@ function Invoke-OktaRequest {
 }
 
 # ---------------------------------------------------------------------------
-# Cached profile -> managerEmail lookup
+# Resolve a person's Okta profile by an identifier that may be a login, an
+# email, or a managerLoginID value. Tries an exact match first; if that
+# 404s, falls back to Okta's user search on the "pid" portion (whatever
+# precedes the first "@"), since source-system addresses don't always
+# match Okta's real login domain.
 # ---------------------------------------------------------------------------
-function Get-CachedManagerEmail {
+function Resolve-OktaUserProfile {
     param(
-        [string]$Login,
+        [string]$Identifier,
         [string]$OktaOrgUrl,
         [hashtable]$Cache,
         [int]$ThrottleMs,
         [int]$MaxRetries
     )
 
-    if ($Cache.ContainsKey($Login)) {
-        return $Cache[$Login]
+    if ($Cache.ContainsKey($Identifier)) {
+        return $Cache[$Identifier]
     }
 
-    $encodedLogin = [uri]::EscapeDataString($Login)
-    $uri = "$OktaOrgUrl/api/v1/users/$encodedLogin"
-    $result = Invoke-OktaRequest -Uri $uri -MaxRetries $MaxRetries
+    $entry = $null
 
-    if ($result.StatusCode -eq 404) {
-        $entry = @{ Found = $false; ManagerEmail = $null }
+    # 1. Exact match on the identifier as given
+    $encoded = [uri]::EscapeDataString($Identifier)
+    $uri = "$OktaOrgUrl/api/v1/users/$encoded"
+    $result = Invoke-OktaRequest -Uri $uri -MaxRetries $MaxRetries
+    Start-Sleep -Milliseconds $ThrottleMs
+
+    if ($result.StatusCode -eq 200) {
+        $entry = @{
+            Found          = $true
+            ManagerEmail   = $result.Content.profile.managerEmail
+            ManagerLoginID = $result.Content.profile.managerLoginID
+            Ambiguous      = $false
+        }
     }
     else {
-        $managerEmail = $result.Content.profile.managerEmail
-        if ([string]::IsNullOrWhiteSpace($managerEmail)) {
-            $entry = @{ Found = $true; ManagerEmail = $null }
+        # 2. Fallback: search on the "pid" (text before "@"), since the
+        #    domain portion of source-system addresses isn't reliably
+        #    Okta's actual login domain.
+        $pidPart = $Identifier.Split('@')[0]
+        if (-not [string]::IsNullOrWhiteSpace($pidPart)) {
+            $searchExpr = 'profile.login sw "' + $pidPart + '@"'
+            $searchUri = "$OktaOrgUrl/api/v1/users?search=$([uri]::EscapeDataString($searchExpr))"
+            $searchResult = Invoke-OktaRequest -Uri $searchUri -MaxRetries $MaxRetries
+            Start-Sleep -Milliseconds $ThrottleMs
+
+            $found = @()
+            if ($searchResult.StatusCode -eq 200 -and $searchResult.Content) {
+                $found = @($searchResult.Content)
+            }
+
+            if ($found.Count -eq 1) {
+                $entry = @{
+                    Found          = $true
+                    ManagerEmail   = $found[0].profile.managerEmail
+                    ManagerLoginID = $found[0].profile.managerLoginID
+                    Ambiguous      = $false
+                }
+            }
+            elseif ($found.Count -gt 1) {
+                $entry = @{ Found = $false; ManagerEmail = $null; ManagerLoginID = $null; Ambiguous = $true }
+            }
+            else {
+                $entry = @{ Found = $false; ManagerEmail = $null; ManagerLoginID = $null; Ambiguous = $false }
+            }
         }
         else {
-            $entry = @{ Found = $true; ManagerEmail = $managerEmail }
+            $entry = @{ Found = $false; ManagerEmail = $null; ManagerLoginID = $null; Ambiguous = $false }
         }
     }
 
-    $Cache[$Login] = $entry
-    Start-Sleep -Milliseconds $ThrottleMs
+    $Cache[$Identifier] = $entry
     return $entry
 }
 
@@ -357,9 +398,11 @@ function Save-Cache {
     param([hashtable]$Cache, [string]$Path)
     $arr = foreach ($key in $Cache.Keys) {
         [PSCustomObject]@{
-            Login        = $key
-            Found        = $Cache[$key].Found
-            ManagerEmail = $Cache[$key].ManagerEmail
+            Identifier     = $key
+            Found          = $Cache[$key].Found
+            ManagerEmail   = $Cache[$key].ManagerEmail
+            ManagerLoginID = $Cache[$key].ManagerLoginID
+            Ambiguous      = $Cache[$key].Ambiguous
         }
     }
     $arr | ConvertTo-Json -Depth 3 | Set-Content -Path $Path -Encoding UTF8
@@ -371,7 +414,11 @@ function Load-Cache {
     if (Test-Path $Path) {
         $data = @(Get-Content $Path -Raw | ConvertFrom-Json)
         foreach ($item in $data) {
-            $cache[$item.Login] = @{ Found = $item.Found; ManagerEmail = $item.ManagerEmail }
+            if ([string]::IsNullOrWhiteSpace($item.Identifier)) { continue }
+            $cache[$item.Identifier] = @{
+                Found = $item.Found; ManagerEmail = $item.ManagerEmail
+                ManagerLoginID = $item.ManagerLoginID; Ambiguous = $item.Ambiguous
+            }
         }
     }
     return $cache
@@ -397,14 +444,14 @@ else {
     Write-Host "Using SSWS token auth." -ForegroundColor Yellow
 }
 
-$inputRows = Import-Csv -Path $InputCsvPath
+$inputRows = Import-Csv -Path $InputCsvPath -Delimiter $Delimiter
 if (-not ($inputRows | Get-Member -Name $LoginColumnName -MemberType NoteProperty)) {
     throw "Column '$LoginColumnName' not found in $InputCsvPath. Columns present: $(($inputRows[0].PSObject.Properties.Name) -join ', ')"
 }
 
 $processedLogins = @{}
 if (Test-Path $OutputCsvPath) {
-    $existing = Import-Csv -Path $OutputCsvPath
+    $existing = Import-Csv -Path $OutputCsvPath -Delimiter $Delimiter
     foreach ($row in $existing) { $processedLogins[$row.Login] = $true }
     Write-Host "Resuming: $($processedLogins.Count) users already in output, will skip them." -ForegroundColor Cyan
 }
@@ -439,38 +486,49 @@ foreach ($row in $inputRows) {
     }
 
     try {
-        $userLookup = Get-CachedManagerEmail -Login $login -OktaOrgUrl $OktaOrgUrl `
+        $employee = Resolve-OktaUserProfile -Identifier $login -OktaOrgUrl $OktaOrgUrl `
             -Cache $cache -ThrottleMs $ThrottleMs -MaxRetries $MaxRetries
 
-        if (-not $userLookup.Found) {
-            $outRow.ManagerStatus          = "ERROR: user not found in Okta"
-            $outRow.SkipLevelManagerStatus = "ERROR: user not found in Okta"
-            $withErrors++
-        }
-        elseif ([string]::IsNullOrWhiteSpace($userLookup.ManagerEmail)) {
-            $outRow.ManagerStatus          = "ERROR: no manager assigned"
-            $outRow.SkipLevelManagerStatus = "ERROR: no manager assigned"
+        if (-not $employee.Found) {
+            $status = if ($employee.Ambiguous) { "ERROR: multiple ambiguous matches in Okta search" } else { "ERROR: user not found in Okta" }
+            $outRow.ManagerStatus          = $status
+            $outRow.SkipLevelManagerStatus = $status
             $withErrors++
         }
         else {
-            $outRow.ManagerEmail  = $userLookup.ManagerEmail
-            $outRow.ManagerStatus = "OK"
+            $managerEmail   = $employee.ManagerEmail
+            $managerLoginID = $employee.ManagerLoginID
 
-            $managerLookup = Get-CachedManagerEmail -Login $userLookup.ManagerEmail -OktaOrgUrl $OktaOrgUrl `
-                -Cache $cache -ThrottleMs $ThrottleMs -MaxRetries $MaxRetries
-
-            if (-not $managerLookup.Found) {
-                $outRow.SkipLevelManagerStatus = "ERROR: manager not found in Okta"
-                $withErrors++
-            }
-            elseif ([string]::IsNullOrWhiteSpace($managerLookup.ManagerEmail)) {
-                $outRow.SkipLevelManagerStatus = "ERROR: manager has no manager assigned"
+            if ([string]::IsNullOrWhiteSpace($managerEmail) -and [string]::IsNullOrWhiteSpace($managerLoginID)) {
+                $outRow.ManagerStatus          = "ERROR: no manager assigned"
+                $outRow.SkipLevelManagerStatus = "ERROR: no manager assigned"
                 $withErrors++
             }
             else {
-                $outRow.SkipLevelManagerEmail  = $managerLookup.ManagerEmail
-                $outRow.SkipLevelManagerStatus = "OK"
-                $fullyOk++
+                $outRow.ManagerEmail  = $managerEmail
+                $outRow.ManagerStatus = "OK"
+
+                # Prefer managerLoginID for the actual lookup (more likely to already
+                # be in Okta's real login format); fall back to managerEmail if blank.
+                $hop1Identifier = if (-not [string]::IsNullOrWhiteSpace($managerLoginID)) { $managerLoginID } else { $managerEmail }
+
+                $manager = Resolve-OktaUserProfile -Identifier $hop1Identifier -OktaOrgUrl $OktaOrgUrl `
+                    -Cache $cache -ThrottleMs $ThrottleMs -MaxRetries $MaxRetries
+
+                if (-not $manager.Found) {
+                    $status = if ($manager.Ambiguous) { "ERROR: multiple ambiguous matches for manager in Okta search" } else { "ERROR: manager not found in Okta" }
+                    $outRow.SkipLevelManagerStatus = $status
+                    $withErrors++
+                }
+                elseif ([string]::IsNullOrWhiteSpace($manager.ManagerEmail)) {
+                    $outRow.SkipLevelManagerStatus = "ERROR: manager has no manager assigned"
+                    $withErrors++
+                }
+                else {
+                    $outRow.SkipLevelManagerEmail  = $manager.ManagerEmail
+                    $outRow.SkipLevelManagerStatus = "OK"
+                    $fullyOk++
+                }
             }
         }
     }
@@ -480,7 +538,7 @@ foreach ($row in $inputRows) {
         $withErrors++
     }
 
-    [PSCustomObject]$outRow | Export-Csv -Path $OutputCsvPath -Append -NoTypeInformation
+    [PSCustomObject]$outRow | Export-Csv -Path $OutputCsvPath -Delimiter $Delimiter -Append -NoTypeInformation
 
     if ($i % 100 -eq 0) {
         Save-Cache -Cache $cache -Path $CachePath
