@@ -184,7 +184,30 @@ function Get-OktaAccessToken {
         client_assertion      = $clientAssertion
     }
 
-    $response = Invoke-RestMethod -Uri $tokenEndpoint -Method Post -Body $body -ContentType "application/x-www-form-urlencoded"
+    try {
+        $response = Invoke-RestMethod -Uri $tokenEndpoint -Method Post -Body $body -ContentType "application/x-www-form-urlencoded" -ErrorAction Stop
+    }
+    catch {
+        $errorBody = $null
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $errorBody = $_.ErrorDetails.Message
+        }
+        elseif ($_.Exception.Response) {
+            try {
+                $stream = $_.Exception.Response.GetResponseStream()
+                $stream.Position = 0
+                $reader = New-Object System.IO.StreamReader($stream)
+                $errorBody = $reader.ReadToEnd()
+            } catch { }
+        }
+        if ($errorBody) {
+            Write-Host "--- Okta token endpoint response ---" -ForegroundColor Red
+            Write-Host $errorBody -ForegroundColor Red
+            Write-Host "-------------------------------------" -ForegroundColor Red
+            throw "Okta token request failed: $errorBody"
+        }
+        throw
+    }
 
     return @{
         AccessToken = $response.access_token
