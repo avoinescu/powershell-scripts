@@ -15,6 +15,12 @@
       - Caching so each unique person is only queried once, no matter how many
         times they appear as someone's manager
 
+    Two auth modes are supported:
+      OAuth (recommended) - client_credentials grant using private_key_jwt.
+          Requires an Okta API Services app with the okta.users.read scope
+          granted and an admin role assigned to the app.
+      SSWS  (fallback)    - a classic SSWS API token.
+
 .PARAMETER InputCsvPath
     CSV with one column containing the user logins. See -LoginColumnName.
 
@@ -25,13 +31,30 @@
 .PARAMETER OktaOrgUrl
     e.g. https://tenant.okta.com  (no trailing slash)
 
-.PARAMETER OktaApiToken
-    Plain-text SSWS API token. See usage notes for how to avoid hardcoding it.
+.PARAMETER OktaClientId
+    Client ID of the OAuth API Services app. (OAuth mode)
 
-.PARAMETER LoginColumnName
-    Name of the column in the input CSV that holds the login. Default: "login"
+.PARAMETER PrivateKeyJwkPath
+    Path to a JSON file containing the private key JWK Okta gave you when you
+    generated the key in the app's Client Credentials section. (OAuth mode)
+
+.PARAMETER Scope
+    OAuth scope to request. Default: okta.users.read
+
+.PARAMETER OktaApiToken
+    Plain-text SSWS API token. (SSWS fallback mode)
 
 .EXAMPLE
+    # OAuth (recommended)
+    .\Resolve-OktaManagerChain.ps1 `
+        -InputCsvPath ".\users.csv" `
+        -OutputCsvPath ".\users_with_managers.csv" `
+        -OktaOrgUrl "https://tenant.okta.com" `
+        -OktaClientId "0oaXXXXXXXXXXXXXXXXX" `
+        -PrivateKeyJwkPath "C:\secure\svc-manager-chain-lookup.jwk.json"
+
+.EXAMPLE
+    # SSWS fallback
     .\Resolve-OktaManagerChain.ps1 `
         -InputCsvPath ".\users.csv" `
         -OutputCsvPath ".\users_with_managers.csv" `
@@ -39,6 +62,7 @@
         -OktaApiToken $plainTextToken
 #>
 
+[CmdletBinding(DefaultParameterSetName = 'OAuth')]
 param(
     [Parameter(Mandatory=$true)]
     [string]$InputCsvPath,
@@ -49,7 +73,18 @@ param(
     [Parameter(Mandatory=$true)]
     [string]$OktaOrgUrl,
 
-    [Parameter(Mandatory=$true)]
+    # --- OAuth (recommended) ---
+    [Parameter(Mandatory=$true, ParameterSetName='OAuth')]
+    [string]$OktaClientId,
+
+    [Parameter(Mandatory=$true, ParameterSetName='OAuth')]
+    [string]$PrivateKeyJwkPath,
+
+    [Parameter(ParameterSetName='OAuth')]
+    [string]$Scope = "okta.users.read",
+
+    # --- SSWS (fallback) ---
+    [Parameter(Mandatory=$true, ParameterSetName='SSWS')]
     [string]$OktaApiToken,
 
     [string]$LoginColumnName = "login",
@@ -58,8 +93,7 @@ param(
 
     [int]$MaxRetries = 5,
 
-    # Base delay between Okta calls, in milliseconds. Raise this if you hit
-    # sustained 429s; lower it once you know your org's rate limit headroom.
+    # Base delay between Okta calls, in milliseconds.
     [int]$ThrottleMs = 150
 )
 
@@ -67,20 +101,147 @@ $ErrorActionPreference = "Stop"
 $OktaOrgUrl = $OktaOrgUrl.TrimEnd('/')
 
 # ---------------------------------------------------------------------------
+# Base64URL helpers (JWT uses base64url, not standard base64)
+# ---------------------------------------------------------------------------
+function ConvertTo-Base64Url {
+    param([byte[]]$Bytes)
+    $b64 = [Convert]::ToBase64String($Bytes)
+    return $b64.TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
+
+function ConvertFrom-Base64Url {
+    param([string]$Base64Url)
+    $s = $Base64Url.Replace('-', '+').Replace('_', '/')
+    switch ($s.Length % 4) {
+        2 { $s += '==' }
+        3 { $s += '=' }
+    }
+    return [Convert]::FromBase64String($s)
+}
+
+# ---------------------------------------------------------------------------
+# OAuth: build an RSA key from the private JWK, sign a client assertion,
+# exchange it for an access token, and keep it refreshed.
+# ---------------------------------------------------------------------------
+function ConvertTo-RsaFromJwk {
+    param([PSCustomObject]$Jwk)
+
+    $rsaParams = New-Object System.Security.Cryptography.RSAParameters
+    $rsaParams.Modulus  = ConvertFrom-Base64Url $Jwk.n
+    $rsaParams.Exponent = ConvertFrom-Base64Url $Jwk.e
+    $rsaParams.D        = ConvertFrom-Base64Url $Jwk.d
+    $rsaParams.P        = ConvertFrom-Base64Url $Jwk.p
+    $rsaParams.Q        = ConvertFrom-Base64Url $Jwk.q
+    $rsaParams.DP       = ConvertFrom-Base64Url $Jwk.dp
+    $rsaParams.DQ       = ConvertFrom-Base64Url $Jwk.dq
+    $rsaParams.InverseQ = ConvertFrom-Base64Url $Jwk.qi
+
+    $rsa = [System.Security.Cryptography.RSA]::Create()
+    $rsa.ImportParameters($rsaParams)
+    return $rsa
+}
+
+function Get-OktaAccessToken {
+    param(
+        [string]$OktaOrgUrl,
+        [string]$ClientId,
+        [PSCustomObject]$Jwk,
+        [string]$Scope
+    )
+
+    $tokenEndpoint = "$OktaOrgUrl/oauth2/v1/token"
+    $now = [DateTimeOffset]::UtcNow
+    $exp = $now.AddMinutes(5)
+
+    $header = @{ alg = "RS256"; typ = "JWT" }
+    if ($Jwk.kid) { $header.kid = $Jwk.kid }
+
+    $payload = @{
+        iss = $ClientId
+        sub = $ClientId
+        aud = $tokenEndpoint
+        iat = [long]$now.ToUnixTimeSeconds()
+        exp = [long]$exp.ToUnixTimeSeconds()
+        jti = [guid]::NewGuid().ToString()
+    }
+
+    $headerB64  = ConvertTo-Base64Url ([System.Text.Encoding]::UTF8.GetBytes(($header  | ConvertTo-Json -Compress)))
+    $payloadB64 = ConvertTo-Base64Url ([System.Text.Encoding]::UTF8.GetBytes(($payload | ConvertTo-Json -Compress)))
+    $signingInput = "$headerB64.$payloadB64"
+
+    $rsa = ConvertTo-RsaFromJwk -Jwk $Jwk
+    $signatureBytes = $rsa.SignData(
+        [System.Text.Encoding]::UTF8.GetBytes($signingInput),
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+        [System.Security.Cryptography.RSASignaturePadding]::Pkcs1
+    )
+    $clientAssertion = "$signingInput.$(ConvertTo-Base64Url $signatureBytes)"
+
+    $body = @{
+        grant_type            = "client_credentials"
+        scope                 = $Scope
+        client_assertion_type = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+        client_assertion      = $clientAssertion
+    }
+
+    $response = Invoke-RestMethod -Uri $tokenEndpoint -Method Post -Body $body -ContentType "application/x-www-form-urlencoded"
+
+    return @{
+        AccessToken = $response.access_token
+        # refresh 60s before actual expiry to avoid edge-of-window failures
+        ExpiresAt   = (Get-Date).AddSeconds([int]$response.expires_in - 60)
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Auth state - shared across all requests, refreshed transparently
+# ---------------------------------------------------------------------------
+$Script:AuthState = @{}
+
+function Initialize-SswsAuth {
+    param([string]$Token)
+    $Script:AuthState = @{ Mode = 'SSWS'; Token = $Token }
+}
+
+function Initialize-OAuthAuth {
+    param([string]$OktaOrgUrl, [string]$ClientId, [PSCustomObject]$Jwk, [string]$Scope)
+    $Script:AuthState = @{
+        Mode = 'OAuth'; OktaOrgUrl = $OktaOrgUrl; ClientId = $ClientId; Jwk = $Jwk; Scope = $Scope
+        AccessToken = $null; ExpiresAt = [datetime]::MinValue
+    }
+    Update-OAuthToken
+}
+
+function Update-OAuthToken {
+    $tokenInfo = Get-OktaAccessToken -OktaOrgUrl $Script:AuthState.OktaOrgUrl `
+        -ClientId $Script:AuthState.ClientId -Jwk $Script:AuthState.Jwk -Scope $Script:AuthState.Scope
+    $Script:AuthState.AccessToken = $tokenInfo.AccessToken
+    $Script:AuthState.ExpiresAt   = $tokenInfo.ExpiresAt
+}
+
+function Get-AuthHeaders {
+    if ($Script:AuthState.Mode -eq 'SSWS') {
+        return @{ Authorization = "SSWS $($Script:AuthState.Token)"; Accept = "application/json" }
+    }
+    if ((Get-Date) -ge $Script:AuthState.ExpiresAt) {
+        Write-Host "Refreshing OAuth access token..." -ForegroundColor DarkGray
+        Update-OAuthToken
+    }
+    return @{ Authorization = "Bearer $($Script:AuthState.AccessToken)"; Accept = "application/json" }
+}
+
+# ---------------------------------------------------------------------------
 # Okta request wrapper with 429 / 5xx retry handling
 # ---------------------------------------------------------------------------
 function Invoke-OktaRequest {
-    param(
-        [string]$Uri,
-        [hashtable]$Headers,
-        [int]$MaxRetries
-    )
+    param([string]$Uri, [int]$MaxRetries)
 
     $attempt = 0
     while ($true) {
         $attempt++
+        $headers = Get-AuthHeaders
         try {
-            $response = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -ErrorAction Stop
+            $response = Invoke-WebRequest -Uri $Uri -Headers $headers -Method Get -ErrorAction Stop
             return @{ StatusCode = 200; Content = ($response.Content | ConvertFrom-Json) }
         }
         catch {
@@ -106,6 +267,15 @@ function Invoke-OktaRequest {
                 Start-Sleep -Seconds $retryAfter
                 continue
             }
+            elseif ($statusCode -eq 401) {
+                # Token may have been revoked/expired unexpectedly - force a refresh and retry once
+                if ($Script:AuthState.Mode -eq 'OAuth' -and $attempt -lt $MaxRetries) {
+                    Write-Warning "401 received, forcing OAuth token refresh and retrying..."
+                    Update-OAuthToken
+                    continue
+                }
+                throw "Unauthorized (401) on $Uri : $($_.Exception.Message)"
+            }
             elseif ($null -eq $statusCode -or $statusCode -ge 500) {
                 if ($attempt -ge $MaxRetries) {
                     throw "Repeated transient failures on $Uri (gave up after $attempt attempts): $($_.Exception.Message)"
@@ -116,7 +286,6 @@ function Invoke-OktaRequest {
                 continue
             }
             else {
-                # 400/401/403/etc - not retryable, surface it
                 throw "Okta request failed ($statusCode) on $Uri : $($_.Exception.Message)"
             }
         }
@@ -129,10 +298,10 @@ function Invoke-OktaRequest {
 function Get-CachedManagerEmail {
     param(
         [string]$Login,
-        [hashtable]$Headers,
         [string]$OktaOrgUrl,
         [hashtable]$Cache,
-        [int]$ThrottleMs
+        [int]$ThrottleMs,
+        [int]$MaxRetries
     )
 
     if ($Cache.ContainsKey($Login)) {
@@ -141,7 +310,7 @@ function Get-CachedManagerEmail {
 
     $encodedLogin = [uri]::EscapeDataString($Login)
     $uri = "$OktaOrgUrl/api/v1/users/$encodedLogin"
-    $result = Invoke-OktaRequest -Uri $uri -Headers $Headers -MaxRetries $MaxRetries
+    $result = Invoke-OktaRequest -Uri $uri -MaxRetries $MaxRetries
 
     if ($result.StatusCode -eq 404) {
         $entry = @{ Found = $false; ManagerEmail = $null }
@@ -192,6 +361,19 @@ if (-not (Test-Path $InputCsvPath)) {
     throw "Input CSV not found: $InputCsvPath"
 }
 
+if ($PSCmdlet.ParameterSetName -eq 'OAuth') {
+    if (-not (Test-Path $PrivateKeyJwkPath)) {
+        throw "Private key JWK file not found: $PrivateKeyJwkPath"
+    }
+    $jwk = Get-Content $PrivateKeyJwkPath -Raw | ConvertFrom-Json
+    Initialize-OAuthAuth -OktaOrgUrl $OktaOrgUrl -ClientId $OktaClientId -Jwk $jwk -Scope $Scope
+    Write-Host "OAuth access token acquired (scope: $Scope)." -ForegroundColor Cyan
+}
+else {
+    Initialize-SswsAuth -Token $OktaApiToken
+    Write-Host "Using SSWS token auth." -ForegroundColor Yellow
+}
+
 $inputRows = Import-Csv -Path $InputCsvPath
 if (-not ($inputRows | Get-Member -Name $LoginColumnName -MemberType NoteProperty)) {
     throw "Column '$LoginColumnName' not found in $InputCsvPath. Columns present: $(($inputRows[0].PSObject.Properties.Name) -join ', ')"
@@ -209,15 +391,10 @@ if ($cache.Count -gt 0) {
     Write-Host "Loaded $($cache.Count) cached profile lookups from $CachePath" -ForegroundColor Cyan
 }
 
-$headers = @{
-    Authorization = "SSWS $OktaApiToken"
-    Accept        = "application/json"
-}
-
-$total        = $inputRows.Count
-$i            = 0
-$fullyOk      = 0
-$withErrors   = 0
+$total      = $inputRows.Count
+$i          = 0
+$fullyOk    = 0
+$withErrors = 0
 
 foreach ($row in $inputRows) {
     $i++
@@ -239,8 +416,8 @@ foreach ($row in $inputRows) {
     }
 
     try {
-        $userLookup = Get-CachedManagerEmail -Login $login -Headers $headers `
-            -OktaOrgUrl $OktaOrgUrl -Cache $cache -ThrottleMs $ThrottleMs
+        $userLookup = Get-CachedManagerEmail -Login $login -OktaOrgUrl $OktaOrgUrl `
+            -Cache $cache -ThrottleMs $ThrottleMs -MaxRetries $MaxRetries
 
         if (-not $userLookup.Found) {
             $outRow.ManagerStatus          = "ERROR: user not found in Okta"
@@ -256,8 +433,8 @@ foreach ($row in $inputRows) {
             $outRow.ManagerEmail  = $userLookup.ManagerEmail
             $outRow.ManagerStatus = "OK"
 
-            $managerLookup = Get-CachedManagerEmail -Login $userLookup.ManagerEmail -Headers $headers `
-                -OktaOrgUrl $OktaOrgUrl -Cache $cache -ThrottleMs $ThrottleMs
+            $managerLookup = Get-CachedManagerEmail -Login $userLookup.ManagerEmail -OktaOrgUrl $OktaOrgUrl `
+                -Cache $cache -ThrottleMs $ThrottleMs -MaxRetries $MaxRetries
 
             if (-not $managerLookup.Found) {
                 $outRow.SkipLevelManagerStatus = "ERROR: manager not found in Okta"
