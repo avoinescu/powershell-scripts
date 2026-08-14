@@ -20,23 +20,23 @@ param(
     [Parameter(Mandatory=$true)] [string]$TestPid,
     [string]$Scope = "okta.users.read"
 )
-
+ 
 $ErrorActionPreference = "Stop"
 $OktaOrgUrl = $OktaOrgUrl.TrimEnd('/')
-
+ 
 function ConvertTo-Base64Url {
     param([byte[]]$Bytes)
     $b64 = [Convert]::ToBase64String($Bytes)
     return $b64.TrimEnd('=').Replace('+', '-').Replace('/', '_')
 }
-
+ 
 function ConvertFrom-Base64Url {
     param([string]$Base64Url)
     $s = $Base64Url.Replace('-', '+').Replace('_', '/')
     switch ($s.Length % 4) { 2 { $s += '==' } 3 { $s += '=' } }
     return [Convert]::FromBase64String($s)
 }
-
+ 
 function ConvertTo-RsaFromJwk {
     param([PSCustomObject]$Jwk)
     $rsaParams = New-Object System.Security.Cryptography.RSAParameters
@@ -52,7 +52,7 @@ function ConvertTo-RsaFromJwk {
     $rsa.ImportParameters($rsaParams)
     return $rsa
 }
-
+ 
 function Get-OktaAccessToken {
     param([string]$OktaOrgUrl, [string]$ClientId, [PSCustomObject]$Jwk, [string]$Scope)
     $tokenEndpoint = "$OktaOrgUrl/oauth2/v1/token"
@@ -81,12 +81,12 @@ function Get-OktaAccessToken {
     $response = Invoke-RestMethod -Uri $tokenEndpoint -Method Post -Body $body -ContentType "application/x-www-form-urlencoded"
     return $response.access_token
 }
-
+ 
 $jwk = Get-Content $PrivateKeyJwkPath -Raw | ConvertFrom-Json
 $accessToken = Get-OktaAccessToken -OktaOrgUrl $OktaOrgUrl -ClientId $OktaClientId -Jwk $jwk -Scope $Scope
 $headers = @{ Authorization = "Bearer $accessToken"; Accept = "application/json" }
 Write-Host "Token acquired.`n" -ForegroundColor Green
-
+ 
 function Try-Call {
     param([string]$Label, [string]$Uri)
     Write-Host "=== $Label ===" -ForegroundColor Cyan
@@ -103,21 +103,23 @@ function Try-Call {
     }
     Write-Host ""
 }
-
+ 
 # A: guess the real domain has no subdomain (nttdata.com instead of na.nttdata.com)
 Try-Call "A: truncated-domain direct lookup" `
     "$OktaOrgUrl/api/v1/users/$([uri]::EscapeDataString("$TestPid@nttdata.com"))"
-
+ 
 # B: q= startsWith match (documented to match firstName/lastName/email)
 Try-Call "B: q= startsWith search" `
     "$OktaOrgUrl/api/v1/users?q=$([uri]::EscapeDataString($TestPid))"
-
+ 
 # C: search= with sw operator on profile.login (may be deprecated - testing anyway)
+$searchExprC = 'profile.login sw "' + $TestPid + '@"'
 Try-Call "C: search= profile.login sw" `
-    "$OktaOrgUrl/api/v1/users?search=$([uri]::EscapeDataString("profile.login sw `"$TestPid@`""))"
-
+    "$OktaOrgUrl/api/v1/users?search=$([uri]::EscapeDataString($searchExprC))"
+ 
 # D: search= with sw operator on profile.email
+$searchExprD = 'profile.email sw "' + $TestPid + '@"'
 Try-Call "D: search= profile.email sw" `
-    "$OktaOrgUrl/api/v1/users?search=$([uri]::EscapeDataString("profile.email sw `"$TestPid@`""))"
-
+    "$OktaOrgUrl/api/v1/users?search=$([uri]::EscapeDataString($searchExprD))"
+ 
 Write-Host "Done. Tell me which section(s) returned the correct user (Harish Jade / 086174)." -ForegroundColor Green
