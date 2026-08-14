@@ -92,7 +92,7 @@ param(
     # Swiss/German-locale Excel exports use ";" not ",". Set to "," if your file is US-style.
     [string]$Delimiter = ";",
 
-    [string]$CachePath = ".\okta_manager_cache.json",
+    [string]$CachePath = $(if ($PSScriptRoot) { Join-Path $PSScriptRoot "okta_manager_cache.json" } else { ".\okta_manager_cache.json" }),
 
     [int]$MaxRetries = 5,
 
@@ -505,8 +505,7 @@ foreach ($row in $inputRows) {
                 $withErrors++
             }
             else {
-                $outRow.ManagerEmail  = $managerEmail
-                $outRow.ManagerStatus = "OK"
+                $outRow.ManagerEmail = $managerEmail
 
                 # Prefer managerLoginID for the actual lookup (more likely to already
                 # be in Okta's real login format); fall back to managerEmail if blank.
@@ -516,18 +515,26 @@ foreach ($row in $inputRows) {
                     -Cache $cache -ThrottleMs $ThrottleMs -MaxRetries $MaxRetries
 
                 if (-not $manager.Found) {
+                    # The manager listed on the employee's profile couldn't actually be
+                    # resolved in Okta - that's a real problem with the ManagerEmail
+                    # reference itself, not just with the skip-level lookup.
                     $status = if ($manager.Ambiguous) { "ERROR: multiple ambiguous matches for manager in Okta search" } else { "ERROR: manager not found in Okta" }
+                    $outRow.ManagerStatus          = $status
                     $outRow.SkipLevelManagerStatus = $status
                     $withErrors++
                 }
-                elseif ([string]::IsNullOrWhiteSpace($manager.ManagerEmail)) {
-                    $outRow.SkipLevelManagerStatus = "ERROR: manager has no manager assigned"
-                    $withErrors++
-                }
                 else {
-                    $outRow.SkipLevelManagerEmail  = $manager.ManagerEmail
-                    $outRow.SkipLevelManagerStatus = "OK"
-                    $fullyOk++
+                    $outRow.ManagerStatus = "OK"
+
+                    if ([string]::IsNullOrWhiteSpace($manager.ManagerEmail)) {
+                        $outRow.SkipLevelManagerStatus = "ERROR: manager has no manager assigned"
+                        $withErrors++
+                    }
+                    else {
+                        $outRow.SkipLevelManagerEmail  = $manager.ManagerEmail
+                        $outRow.SkipLevelManagerStatus = "OK"
+                        $fullyOk++
+                    }
                 }
             }
         }
