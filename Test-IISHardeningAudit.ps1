@@ -38,12 +38,22 @@
     .\Test-IISHardeningAudit.ps1 -SiteName "Default Web Site","Intranet App" -RequireWindowsAuth -ExportPath C:\Audits
 
 .NOTES
-    Run from an elevated, 64-bit PowerShell session. Under 32-bit
-    PowerShell on a 64-bit OS, HKLM:\SOFTWARE\Microsoft\InetStp can be
-    WOW6432Node-redirected and misreport the IIS version.
+    Run from an elevated, 64-bit, Windows PowerShell 5.1 session (not
+    PowerShell 7 — the WebAdministration module is a legacy binary
+    module and its IIS: provider generally does not register cleanly
+    under pwsh). Under 32-bit PowerShell on a 64-bit OS,
+    HKLM:\SOFTWARE\Microsoft\InetStp can also be WOW6432Node-redirected
+    and misreport the IIS version.
+
+    Forced read-only: this script declares SupportsShouldProcess and
+    sets $WhatIfPreference = $true itself, so any ShouldProcess-aware
+    cmdlet (Set-*/New-*/Remove-*/Enable-*/Disable-*) added here later —
+    by accident or otherwise — no-ops and reports what it would have
+    done instead of running. This script calls none of those today; the
+    setting is defense in depth, not a fix for a real problem.
 #>
 
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [string[]]$SiteName,
     [switch]$RequireWindowsAuth,
@@ -55,9 +65,24 @@ $WhatIfPreference = $true
 
 Import-Module WebAdministration -ErrorAction SilentlyContinue
 
+$WebAdminAvailable = [bool](Get-Module WebAdministration)
+
+if (-not $WebAdminAvailable) {
+    Write-Host ""
+    Write-Host "WARNING: The WebAdministration module/provider did not load." -ForegroundColor Red
+    Write-Host "  All IIS-dependent checks below will report NEEDS REVIEW (or a" -ForegroundColor Yellow
+    Write-Host "  misleading PASS, e.g. 'Default Web Site: Not Present') until this" -ForegroundColor Yellow
+    Write-Host "  is resolved. Most common causes, in order of likelihood:" -ForegroundColor Yellow
+    Write-Host "    1. This session is not elevated (Run as Administrator)." -ForegroundColor Yellow
+    Write-Host "    2. This is PowerShell 7 (pwsh), not Windows PowerShell 5.1." -ForegroundColor Yellow
+    Write-Host "       Check with: `$PSVersionTable.PSEdition  (must say 'Desktop')" -ForegroundColor Yellow
+    Write-Host "    3. The 'IIS Management Scripts and Tools' feature isn't installed." -ForegroundColor Yellow
+    Write-Host ""
+}
+
 $Results = @()
 
-function Add-Result {
+function Write-AuditResult {
     param(
         [string]$Control,
         [string]$Status,
@@ -79,10 +104,10 @@ Write-Host "Running IIS Hardening Audit..." -ForegroundColor Cyan
 
 try {
     $iis = Get-ItemProperty HKLM:\SOFTWARE\Microsoft\InetStp
-    Add-Result "IIS Version" "PASS" $iis.VersionString
+    Write-AuditResult "IIS Version" "PASS" $iis.VersionString
 }
 catch {
-    Add-Result "IIS Version" "NEEDS REVIEW" $_.Exception.Message
+    Write-AuditResult "IIS Version" "NEEDS REVIEW" $_.Exception.Message
 }
 
 # =====================================================
@@ -93,14 +118,14 @@ try {
     $site = Get-Website "Default Web Site" -ErrorAction Stop
 
     if ($site.State -eq "Stopped") {
-        Add-Result "Default Web Site" "PASS" "Stopped"
+        Write-AuditResult "Default Web Site" "PASS" "Stopped"
     }
     else {
-        Add-Result "Default Web Site" "FAIL" "Running"
+        Write-AuditResult "Default Web Site" "FAIL" "Running"
     }
 }
 catch {
-    Add-Result "Default Web Site" "PASS" "Not Present"
+    Write-AuditResult "Default Web Site" "PASS" "Not Present"
 }
 
 # =====================================================
@@ -113,14 +138,14 @@ try {
         -Name enabled
 
     if ($dirBrowsing.Value -eq $false) {
-        Add-Result "Directory Browsing" "PASS" "Disabled"
+        Write-AuditResult "Directory Browsing" "PASS" "Disabled"
     }
     else {
-        Add-Result "Directory Browsing" "FAIL" "Enabled"
+        Write-AuditResult "Directory Browsing" "FAIL" "Enabled"
     }
 }
 catch {
-    Add-Result "Directory Browsing" "NEEDS REVIEW" "Unable to determine"
+    Write-AuditResult "Directory Browsing" "NEEDS REVIEW" "Unable to determine"
 }
 
 # =====================================================
@@ -155,31 +180,31 @@ $tls12 = Get-TLSState "TLS 1.2"
 $tls13 = Get-TLSState "TLS 1.3"
 
 if ($tls10 -eq 0) {
-    Add-Result "TLS 1.0" "PASS" "Disabled"
+    Write-AuditResult "TLS 1.0" "PASS" "Disabled"
 }
 else {
-    Add-Result "TLS 1.0" "FAIL" "Enabled"
+    Write-AuditResult "TLS 1.0" "FAIL" "Enabled"
 }
 
 if ($tls11 -eq 0) {
-    Add-Result "TLS 1.1" "PASS" "Disabled"
+    Write-AuditResult "TLS 1.1" "PASS" "Disabled"
 }
 else {
-    Add-Result "TLS 1.1" "NEEDS REVIEW" "Enabled"
+    Write-AuditResult "TLS 1.1" "NEEDS REVIEW" "Enabled"
 }
 
 if ($tls12 -ne 0) {
-    Add-Result "TLS 1.2" "PASS" "Enabled"
+    Write-AuditResult "TLS 1.2" "PASS" "Enabled"
 }
 else {
-    Add-Result "TLS 1.2" "FAIL" "Disabled"
+    Write-AuditResult "TLS 1.2" "FAIL" "Disabled"
 }
 
 if ($tls13 -ne 0 -or $null -eq $tls13) {
-    Add-Result "TLS 1.3" "PASS" "Available"
+    Write-AuditResult "TLS 1.3" "PASS" "Available"
 }
 else {
-    Add-Result "TLS 1.3" "NEEDS REVIEW" "Disabled"
+    Write-AuditResult "TLS 1.3" "NEEDS REVIEW" "Disabled"
 }
 
 # =====================================================
@@ -188,17 +213,17 @@ else {
 
 try {
 
-    $https = Get-WebBinding -Protocol https
+    $https = @(Get-WebBinding -Protocol https)
 
     if ($https.Count -gt 0) {
-        Add-Result "HTTPS Bindings" "PASS" "$($https.Count) Binding(s)"
+        Write-AuditResult "HTTPS Bindings" "PASS" "$($https.Count) Binding(s)"
     }
     else {
-        Add-Result "HTTPS Bindings" "FAIL" "None Found"
+        Write-AuditResult "HTTPS Bindings" "FAIL" "None Found"
     }
 }
 catch {
-    Add-Result "HTTPS Bindings" "NEEDS REVIEW" "Unable to verify"
+    Write-AuditResult "HTTPS Bindings" "NEEDS REVIEW" "Unable to verify"
 }
 
 # =====================================================
@@ -210,21 +235,21 @@ try {
     $ciphers = Get-TlsCipherSuite
 
     if ($ciphers.Name -match "RC4") {
-        Add-Result "RC4 Cipher" "FAIL" "Detected"
+        Write-AuditResult "RC4 Cipher" "FAIL" "Detected"
     }
     else {
-        Add-Result "RC4 Cipher" "PASS" "Not Detected"
+        Write-AuditResult "RC4 Cipher" "PASS" "Not Detected"
     }
 
     if ($ciphers.Name -match "DES|3DES") {
-        Add-Result "DES/3DES Cipher" "FAIL" "Detected"
+        Write-AuditResult "DES/3DES Cipher" "FAIL" "Detected"
     }
     else {
-        Add-Result "DES/3DES Cipher" "PASS" "Not Detected"
+        Write-AuditResult "DES/3DES Cipher" "PASS" "Not Detected"
     }
 }
 catch {
-    Add-Result "Weak Cipher Audit" "NEEDS REVIEW" "Get-TlsCipherSuite unavailable"
+    Write-AuditResult "Weak Cipher Audit" "NEEDS REVIEW" "Get-TlsCipherSuite unavailable"
 }
 
 # =====================================================
@@ -240,14 +265,14 @@ try {
 
         if ($DaysLeft -lt 0) {
 
-            Add-Result `
+            Write-AuditResult `
             "Certificate $($_.Subject)" `
             "FAIL" `
             "Expired"
 
         } elseif ($DaysLeft -lt 30) {
 
-            Add-Result `
+            Write-AuditResult `
             "Certificate $($_.Subject)" `
             "NEEDS REVIEW" `
             "$DaysLeft Days Left"
@@ -255,7 +280,7 @@ try {
         }
         else {
 
-            Add-Result `
+            Write-AuditResult `
             "Certificate $($_.Subject)" `
             "PASS" `
             "$DaysLeft Days Left"
@@ -265,7 +290,7 @@ try {
 
 }
 catch {
-    Add-Result "Certificate Audit" "NEEDS REVIEW" "Unable to Read Store"
+    Write-AuditResult "Certificate Audit" "NEEDS REVIEW" "Unable to Read Store"
 }
 
 # =====================================================
@@ -284,7 +309,7 @@ try {
 
     if ($PatchAge -le 45) {
 
-        Add-Result `
+        Write-AuditResult `
         "Windows Patch Level" `
         "PASS" `
         "Last patch $($LastPatch.InstalledOn.ToShortDateString())"
@@ -292,7 +317,7 @@ try {
     }
     else {
 
-        Add-Result `
+        Write-AuditResult `
         "Windows Patch Level" `
         "FAIL" `
         "Patch age $PatchAge days"
@@ -300,7 +325,7 @@ try {
     }
 }
 catch {
-    Add-Result "Windows Patch Level" "NEEDS REVIEW" "Unable to Determine"
+    Write-AuditResult "Windows Patch Level" "NEEDS REVIEW" "Unable to Determine"
 }
 
 # =====================================================
@@ -328,14 +353,14 @@ foreach ($Site in $SitesToAudit) {
 
         if ($Binding.bindingInformation -match '\*\:\d+\:$') {
 
-            Add-Result `
+            Write-AuditResult `
             "$CurrentSiteName Host Header" `
             "FAIL" `
             $Binding.bindingInformation
         }
         else {
 
-            Add-Result `
+            Write-AuditResult `
             "$CurrentSiteName Host Header" `
             "PASS" `
             $Binding.bindingInformation
@@ -354,7 +379,7 @@ foreach ($Site in $SitesToAudit) {
             $Hash = $HttpsBinding.certificateHash
 
             if ([string]::IsNullOrEmpty($Hash)) {
-                Add-Result `
+                Write-AuditResult `
                 "$CurrentSiteName Bound Certificate" `
                 "FAIL" `
                 "No certificate bound ($($HttpsBinding.bindingInformation))"
@@ -365,26 +390,26 @@ foreach ($Site in $SitesToAudit) {
                 Where-Object { $_.Thumbprint -eq $Hash }
 
             if (-not $BoundCert) {
-                Add-Result `
+                Write-AuditResult `
                 "$CurrentSiteName Bound Certificate" `
                 "NEEDS REVIEW" `
                 "Bound cert hash $Hash not found in LocalMachine\My"
             }
             elseif ($BoundCert.NotAfter -lt (Get-Date)) {
-                Add-Result `
+                Write-AuditResult `
                 "$CurrentSiteName Bound Certificate" `
                 "FAIL" `
                 "Expired $($BoundCert.NotAfter.ToShortDateString())"
             }
             else {
-                Add-Result `
+                Write-AuditResult `
                 "$CurrentSiteName Bound Certificate" `
                 "PASS" `
                 "Valid until $($BoundCert.NotAfter.ToShortDateString())"
             }
         }
         catch {
-            Add-Result `
+            Write-AuditResult `
             "$CurrentSiteName Bound Certificate" `
             "NEEDS REVIEW" `
             "Unable to cross-reference bound certificate"
@@ -404,10 +429,10 @@ foreach ($Site in $SitesToAudit) {
         -Name enabled
 
         if ($Anon.Value -eq $false) {
-            Add-Result "$CurrentSiteName Anonymous Auth" "PASS" "Disabled"
+            Write-AuditResult "$CurrentSiteName Anonymous Auth" "PASS" "Disabled"
         }
         else {
-            Add-Result "$CurrentSiteName Anonymous Auth" "NEEDS REVIEW" "Enabled"
+            Write-AuditResult "$CurrentSiteName Anonymous Auth" "NEEDS REVIEW" "Enabled"
         }
 
     }
@@ -424,17 +449,17 @@ foreach ($Site in $SitesToAudit) {
         if ($RequireWindowsAuth) {
 
             if ($WinAuth.Value -eq $true) {
-                Add-Result "$CurrentSiteName Windows Auth" "PASS" "Enabled"
+                Write-AuditResult "$CurrentSiteName Windows Auth" "PASS" "Enabled"
             }
             else {
-                Add-Result "$CurrentSiteName Windows Auth" "NEEDS REVIEW" "Disabled"
+                Write-AuditResult "$CurrentSiteName Windows Auth" "NEEDS REVIEW" "Disabled"
             }
         }
         else {
             # No assumption about whether this site should use Windows
             # Auth (only relevant for intranet/SSO apps) — informational only.
             $State = if ($WinAuth.Value -eq $true) { "Enabled" } else { "Disabled" }
-            Add-Result "$CurrentSiteName Windows Auth" "INFO" $State
+            Write-AuditResult "$CurrentSiteName Windows Auth" "INFO" $State
         }
 
     }
@@ -447,10 +472,10 @@ foreach ($Site in $SitesToAudit) {
     try {
 
         if ($Site.logFile.enabled) {
-            Add-Result "$CurrentSiteName Logging" "PASS" "Enabled"
+            Write-AuditResult "$CurrentSiteName Logging" "PASS" "Enabled"
         }
         else {
-            Add-Result "$CurrentSiteName Logging" "FAIL" "Disabled"
+            Write-AuditResult "$CurrentSiteName Logging" "FAIL" "Disabled"
         }
 
     }
@@ -462,7 +487,7 @@ foreach ($Site in $SitesToAudit) {
 
     if ($Site.PhysicalPath -match "^C:\\inetpub\\wwwroot") {
 
-        Add-Result `
+        Write-AuditResult `
         "$CurrentSiteName Content Location" `
         "FAIL" `
         $Site.PhysicalPath
@@ -470,7 +495,7 @@ foreach ($Site in $SitesToAudit) {
     }
     else {
 
-        Add-Result `
+        Write-AuditResult `
         "$CurrentSiteName Content Location" `
         "PASS" `
         $Site.PhysicalPath
@@ -499,14 +524,14 @@ foreach ($Site in $SitesToAudit) {
 
             if ($BadEntries) {
 
-                Add-Result `
+                Write-AuditResult `
                 "$CurrentSiteName NTFS Permissions" `
                 "FAIL" `
                 "Broad permissions detected"
             }
             else {
 
-                Add-Result `
+                Write-AuditResult `
                 "$CurrentSiteName NTFS Permissions" `
                 "PASS" `
                 "No obvious issues"
@@ -515,7 +540,7 @@ foreach ($Site in $SitesToAudit) {
 
     }
     catch {
-        Add-Result "$CurrentSiteName NTFS Permissions" `
+        Write-AuditResult "$CurrentSiteName NTFS Permissions" `
         "NEEDS REVIEW" `
         "Unable to read ACL"
     }
@@ -533,14 +558,14 @@ ForEach-Object {
 
     if ($Identity -eq "ApplicationPoolIdentity") {
 
-        Add-Result `
+        Write-AuditResult `
         "App Pool [$Pool]" `
         "PASS" `
         $Identity
     }
     else {
 
-        Add-Result `
+        Write-AuditResult `
         "App Pool [$Pool]" `
         "FAIL" `
         $Identity
@@ -570,14 +595,14 @@ try {
     }
 
     if ($TraceFound) {
-        Add-Result "HTTP TRACE" "FAIL" "Enabled"
+        Write-AuditResult "HTTP TRACE" "FAIL" "Enabled"
     }
     else {
-        Add-Result "HTTP TRACE" "PASS" "Disabled"
+        Write-AuditResult "HTTP TRACE" "PASS" "Disabled"
     }
 }
 catch {
-    Add-Result "HTTP TRACE" "NEEDS REVIEW" "Unable to Verify"
+    Write-AuditResult "HTTP TRACE" "NEEDS REVIEW" "Unable to Verify"
 }
 
 # =====================================================
@@ -598,36 +623,36 @@ try {
     }
 
     if (HeaderExists "Strict-Transport-Security") {
-        Add-Result "HSTS" "PASS" "Configured"
+        Write-AuditResult "HSTS" "PASS" "Configured"
     }
     else {
-        Add-Result "HSTS" "FAIL" "Missing"
+        Write-AuditResult "HSTS" "FAIL" "Missing"
     }
 
     if (HeaderExists "X-Frame-Options") {
-        Add-Result "X-Frame-Options" "PASS" "Configured"
+        Write-AuditResult "X-Frame-Options" "PASS" "Configured"
     }
     else {
-        Add-Result "X-Frame-Options" "FAIL" "Missing"
+        Write-AuditResult "X-Frame-Options" "FAIL" "Missing"
     }
 
     if (HeaderExists "X-Content-Type-Options") {
-        Add-Result "X-Content-Type-Options" "PASS" "Configured"
+        Write-AuditResult "X-Content-Type-Options" "PASS" "Configured"
     }
     else {
-        Add-Result "X-Content-Type-Options" "FAIL" "Missing"
+        Write-AuditResult "X-Content-Type-Options" "FAIL" "Missing"
     }
 
     if (HeaderExists "Content-Security-Policy") {
-        Add-Result "Content-Security-Policy" "PASS" "Configured"
+        Write-AuditResult "Content-Security-Policy" "PASS" "Configured"
     }
     else {
-        Add-Result "Content-Security-Policy" "NEEDS REVIEW" "Missing"
+        Write-AuditResult "Content-Security-Policy" "NEEDS REVIEW" "Missing"
     }
 
 }
 catch {
-    Add-Result "Security Headers" `
+    Write-AuditResult "Security Headers" `
     "NEEDS REVIEW" `
     "Unable To Read"
 }
@@ -652,7 +677,7 @@ foreach ($ServiceName in $SIEMServices) {
 
         if ($Service.Status -eq "Running") {
 
-            Add-Result `
+            Write-AuditResult `
             "SIEM Agent $ServiceName" `
             "PASS" `
             "Running"
@@ -660,7 +685,7 @@ foreach ($ServiceName in $SIEMServices) {
         }
         else {
 
-            Add-Result `
+            Write-AuditResult `
             "SIEM Agent $ServiceName" `
             "FAIL" `
             "Stopped"
@@ -696,14 +721,14 @@ $SitesToAudit | ForEach-Object {
 
                 if ($Debug -eq "false") {
 
-                    Add-Result `
+                    Write-AuditResult `
                     "$CurrentSiteName ASP.NET Debug" `
                     "PASS" `
                     $_.FullName
                 }
                 elseif ($Debug) {
 
-                    Add-Result `
+                    Write-AuditResult `
                     "$CurrentSiteName ASP.NET Debug" `
                     "FAIL" `
                     $_.FullName
@@ -715,21 +740,21 @@ $SitesToAudit | ForEach-Object {
                 switch ($CustomErrors) {
 
                     "On" {
-                        Add-Result `
+                        Write-AuditResult `
                         "$CurrentSiteName Custom Errors" `
                         "PASS" `
                         "On"
                     }
 
                     "RemoteOnly" {
-                        Add-Result `
+                        Write-AuditResult `
                         "$CurrentSiteName Custom Errors" `
                         "PASS" `
                         "RemoteOnly"
                     }
 
                     "Off" {
-                        Add-Result `
+                        Write-AuditResult `
                         "$CurrentSiteName Custom Errors" `
                         "FAIL" `
                         "Off"
@@ -749,13 +774,13 @@ $SitesToAudit | ForEach-Object {
 # =====================================================
 
 $Pass =
-($Results | Where-Object Status -eq "PASS").Count
+@($Results | Where-Object Status -eq "PASS").Count
 
 $Fail =
-($Results | Where-Object Status -eq "FAIL").Count
+@($Results | Where-Object Status -eq "FAIL").Count
 
 $Review =
-($Results | Where-Object Status -eq "NEEDS REVIEW").Count
+@($Results | Where-Object Status -eq "NEEDS REVIEW").Count
 
 $Total = $Results.Count
 
