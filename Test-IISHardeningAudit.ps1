@@ -1,7 +1,57 @@
-# =====================================================
-# IIS HARDENING AUDIT SCRIPT (READ ONLY)
-# IIS 10 / Windows Server 2022 / 2025
-# =====================================================
+<#
+.SYNOPSIS
+    Read-only IIS hardening / security baseline audit.
+
+.DESCRIPTION
+    Audits a Windows Server IIS installation against a set of hardening
+    checks (TLS protocols/ciphers, certificates including bound-cert
+    validity, HTTPS bindings, authentication, logging, content location,
+    NTFS permissions, application pool identity, HTTP TRACE, security
+    headers, SIEM agent presence, ASP.NET debug/customErrors config, and
+    Windows patch age) and reports PASS / FAIL / NEEDS REVIEW / INFO per
+    control.
+
+    This script performs NO modifications. Every check is read-only
+    (Get-*, Test-Path). Nothing is Set, New, Removed, Enabled, or Disabled.
+
+.PARAMETER SiteName
+    Optional. Restrict the per-site checks (bindings, auth, logging,
+    content location, NTFS, ASP.NET config) to one or more site names.
+    Defaults to all sites returned by Get-Website.
+
+.PARAMETER RequireWindowsAuth
+    Optional switch. Windows Authentication is only expected on
+    intranet / SSO-integrated apps, not on public-facing sites, so by
+    default the script reports its state as INFO without judging it.
+    Set this switch to instead flag disabled Windows Auth as NEEDS REVIEW.
+
+.PARAMETER ExportPath
+    Optional. Folder to export the full results as CSV and HTML
+    (e.g. C:\Audits). Created if it doesn't exist. If omitted, results
+    are only written to the console. This is the only way the script
+    writes anything to disk, and it never touches IIS or Windows config.
+
+.EXAMPLE
+    .\Test-IISHardeningAudit.ps1
+
+.EXAMPLE
+    .\Test-IISHardeningAudit.ps1 -SiteName "Default Web Site","Intranet App" -RequireWindowsAuth -ExportPath C:\Audits
+
+.NOTES
+    Run from an elevated, 64-bit PowerShell session. Under 32-bit
+    PowerShell on a 64-bit OS, HKLM:\SOFTWARE\Microsoft\InetStp can be
+    WOW6432Node-redirected and misreport the IIS version.
+#>
+
+[CmdletBinding()]
+param(
+    [string[]]$SiteName,
+    [switch]$RequireWindowsAuth,
+    [string]$ExportPath
+)
+
+Set-StrictMode -Version Latest
+$WhatIfPreference = $true
 
 Import-Module WebAdministration -ErrorAction SilentlyContinue
 
@@ -86,7 +136,7 @@ function Get-TLSState {
 
     $Key = Join-Path $ProtocolBase "$Protocol\Server"
 
-    if(Test-Path $Key) {
+    if (Test-Path $Key) {
 
         try {
             return (Get-ItemProperty $Key).Enabled
@@ -104,28 +154,28 @@ $tls11 = Get-TLSState "TLS 1.1"
 $tls12 = Get-TLSState "TLS 1.2"
 $tls13 = Get-TLSState "TLS 1.3"
 
-if($tls10 -eq 0) {
+if ($tls10 -eq 0) {
     Add-Result "TLS 1.0" "PASS" "Disabled"
 }
 else {
     Add-Result "TLS 1.0" "FAIL" "Enabled"
 }
 
-if($tls11 -eq 0) {
+if ($tls11 -eq 0) {
     Add-Result "TLS 1.1" "PASS" "Disabled"
 }
 else {
     Add-Result "TLS 1.1" "NEEDS REVIEW" "Enabled"
 }
 
-if($tls12 -ne 0) {
+if ($tls12 -ne 0) {
     Add-Result "TLS 1.2" "PASS" "Enabled"
 }
 else {
     Add-Result "TLS 1.2" "FAIL" "Disabled"
 }
 
-if($tls13 -ne 0 -or $tls13 -eq $null) {
+if ($tls13 -ne 0 -or $null -eq $tls13) {
     Add-Result "TLS 1.3" "PASS" "Available"
 }
 else {
@@ -140,7 +190,7 @@ try {
 
     $https = Get-WebBinding -Protocol https
 
-    if($https.Count -gt 0) {
+    if ($https.Count -gt 0) {
         Add-Result "HTTPS Bindings" "PASS" "$($https.Count) Binding(s)"
     }
     else {
@@ -178,7 +228,7 @@ catch {
 }
 
 # =====================================================
-# CERTIFICATES
+# CERTIFICATES (full LocalMachine\My store)
 # =====================================================
 
 try {
@@ -188,14 +238,14 @@ try {
 
         $DaysLeft = ($_.NotAfter - (Get-Date)).Days
 
-        if($DaysLeft -lt 0) {
+        if ($DaysLeft -lt 0) {
 
             Add-Result `
             "Certificate $($_.Subject)" `
             "FAIL" `
             "Expired"
 
-        } elseif($DaysLeft -lt 30) {
+        } elseif ($DaysLeft -lt 30) {
 
             Add-Result `
             "Certificate $($_.Subject)" `
@@ -232,7 +282,7 @@ try {
     $PatchAge =
     ((Get-Date) - $LastPatch.InstalledOn).Days
 
-    if($PatchAge -le 45) {
+    if ($PatchAge -le 45) {
 
         Add-Result `
         "Windows Patch Level" `
@@ -257,31 +307,87 @@ catch {
 # WEBSITE AUDITS
 # =====================================================
 
-foreach($Site in Get-Website) {
+$SitesToAudit = if ($SiteName) {
+    Get-Website | Where-Object { $_.Name -in $SiteName }
+}
+else {
+    Get-Website
+}
 
-    $SiteName = $Site.Name
+foreach ($Site in $SitesToAudit) {
+
+    $CurrentSiteName = $Site.Name
+
+    $Bindings = Get-WebBinding -Name $CurrentSiteName
 
     # ----------------------------------------------
     # Host Header Bindings
     # ----------------------------------------------
 
-    $Bindings = Get-WebBinding -Name $SiteName
+    foreach ($Binding in $Bindings) {
 
-    foreach($Binding in $Bindings) {
-
-        if($Binding.bindingInformation -match '\*\:\d+\:$') {
+        if ($Binding.bindingInformation -match '\*\:\d+\:$') {
 
             Add-Result `
-            "$SiteName Host Header" `
+            "$CurrentSiteName Host Header" `
             "FAIL" `
             $Binding.bindingInformation
         }
         else {
 
             Add-Result `
-            "$SiteName Host Header" `
+            "$CurrentSiteName Host Header" `
             "PASS" `
             $Binding.bindingInformation
+        }
+    }
+
+    # ----------------------------------------------
+    # Bound Certificate Validity (per HTTPS binding)
+    # ----------------------------------------------
+
+    $HttpsBindings = $Bindings | Where-Object { $_.protocol -eq "https" }
+
+    foreach ($HttpsBinding in $HttpsBindings) {
+
+        try {
+            $Hash = $HttpsBinding.certificateHash
+
+            if ([string]::IsNullOrEmpty($Hash)) {
+                Add-Result `
+                "$CurrentSiteName Bound Certificate" `
+                "FAIL" `
+                "No certificate bound ($($HttpsBinding.bindingInformation))"
+                continue
+            }
+
+            $BoundCert = Get-ChildItem Cert:\LocalMachine\My |
+                Where-Object { $_.Thumbprint -eq $Hash }
+
+            if (-not $BoundCert) {
+                Add-Result `
+                "$CurrentSiteName Bound Certificate" `
+                "NEEDS REVIEW" `
+                "Bound cert hash $Hash not found in LocalMachine\My"
+            }
+            elseif ($BoundCert.NotAfter -lt (Get-Date)) {
+                Add-Result `
+                "$CurrentSiteName Bound Certificate" `
+                "FAIL" `
+                "Expired $($BoundCert.NotAfter.ToShortDateString())"
+            }
+            else {
+                Add-Result `
+                "$CurrentSiteName Bound Certificate" `
+                "PASS" `
+                "Valid until $($BoundCert.NotAfter.ToShortDateString())"
+            }
+        }
+        catch {
+            Add-Result `
+            "$CurrentSiteName Bound Certificate" `
+            "NEEDS REVIEW" `
+            "Unable to cross-reference bound certificate"
         }
     }
 
@@ -293,15 +399,15 @@ foreach($Site in Get-Website) {
 
         $Anon =
         Get-WebConfigurationProperty `
-        -Location $SiteName `
+        -Location $CurrentSiteName `
         -Filter system.webServer/security/authentication/anonymousAuthentication `
         -Name enabled
 
-        if($Anon.Value -eq $false) {
-            Add-Result "$SiteName Anonymous Auth" "PASS" "Disabled"
+        if ($Anon.Value -eq $false) {
+            Add-Result "$CurrentSiteName Anonymous Auth" "PASS" "Disabled"
         }
         else {
-            Add-Result "$SiteName Anonymous Auth" "NEEDS REVIEW" "Enabled"
+            Add-Result "$CurrentSiteName Anonymous Auth" "NEEDS REVIEW" "Enabled"
         }
 
     }
@@ -311,15 +417,24 @@ foreach($Site in Get-Website) {
 
         $WinAuth =
         Get-WebConfigurationProperty `
-        -Location $SiteName `
+        -Location $CurrentSiteName `
         -Filter system.webServer/security/authentication/windowsAuthentication `
         -Name enabled
 
-        if($WinAuth.Value -eq $true) {
-            Add-Result "$SiteName Windows Auth" "PASS" "Enabled"
+        if ($RequireWindowsAuth) {
+
+            if ($WinAuth.Value -eq $true) {
+                Add-Result "$CurrentSiteName Windows Auth" "PASS" "Enabled"
+            }
+            else {
+                Add-Result "$CurrentSiteName Windows Auth" "NEEDS REVIEW" "Disabled"
+            }
         }
         else {
-            Add-Result "$SiteName Windows Auth" "NEEDS REVIEW" "Disabled"
+            # No assumption about whether this site should use Windows
+            # Auth (only relevant for intranet/SSO apps) — informational only.
+            $State = if ($WinAuth.Value -eq $true) { "Enabled" } else { "Disabled" }
+            Add-Result "$CurrentSiteName Windows Auth" "INFO" $State
         }
 
     }
@@ -331,11 +446,11 @@ foreach($Site in Get-Website) {
 
     try {
 
-        if($Site.logFile.enabled) {
-            Add-Result "$SiteName Logging" "PASS" "Enabled"
+        if ($Site.logFile.enabled) {
+            Add-Result "$CurrentSiteName Logging" "PASS" "Enabled"
         }
         else {
-            Add-Result "$SiteName Logging" "FAIL" "Disabled"
+            Add-Result "$CurrentSiteName Logging" "FAIL" "Disabled"
         }
 
     }
@@ -345,10 +460,10 @@ foreach($Site in Get-Website) {
     # Content Location
     # ----------------------------------------------
 
-    if($Site.PhysicalPath -match "^C:\\inetpub\\wwwroot") {
+    if ($Site.PhysicalPath -match "^C:\\inetpub\\wwwroot") {
 
         Add-Result `
-        "$SiteName Content Location" `
+        "$CurrentSiteName Content Location" `
         "FAIL" `
         $Site.PhysicalPath
 
@@ -356,7 +471,7 @@ foreach($Site in Get-Website) {
     else {
 
         Add-Result `
-        "$SiteName Content Location" `
+        "$CurrentSiteName Content Location" `
         "PASS" `
         $Site.PhysicalPath
     }
@@ -367,7 +482,7 @@ foreach($Site in Get-Website) {
 
     try {
 
-        if(Test-Path $Site.PhysicalPath) {
+        if (Test-Path $Site.PhysicalPath) {
 
             $Acl = Get-Acl $Site.PhysicalPath
 
@@ -382,17 +497,17 @@ foreach($Site in Get-Website) {
 
             }
 
-            if($BadEntries) {
+            if ($BadEntries) {
 
                 Add-Result `
-                "$SiteName NTFS Permissions" `
+                "$CurrentSiteName NTFS Permissions" `
                 "FAIL" `
                 "Broad permissions detected"
             }
             else {
 
                 Add-Result `
-                "$SiteName NTFS Permissions" `
+                "$CurrentSiteName NTFS Permissions" `
                 "PASS" `
                 "No obvious issues"
             }
@@ -400,7 +515,7 @@ foreach($Site in Get-Website) {
 
     }
     catch {
-        Add-Result "$SiteName NTFS Permissions" `
+        Add-Result "$CurrentSiteName NTFS Permissions" `
         "NEEDS REVIEW" `
         "Unable to read ACL"
     }
@@ -416,7 +531,7 @@ ForEach-Object {
     $Pool = $_.Name
     $Identity = $_.processModel.identityType
 
-    if($Identity -eq "ApplicationPoolIdentity") {
+    if ($Identity -eq "ApplicationPoolIdentity") {
 
         Add-Result `
         "App Pool [$Pool]" `
@@ -444,17 +559,17 @@ try {
     Get-WebConfiguration `
     -Filter "system.webServer/security/requestFiltering/verbs"
 
-    foreach($Verb in $Verbs.Collection) {
+    foreach ($Verb in $Verbs.Collection) {
 
-        if($Verb.verb -eq "TRACE" -and
+        if ($Verb.verb -eq "TRACE" -and
            $Verb.allowed -eq $true) {
 
-            $TraceFound=$true
+            $TraceFound = $true
         }
 
     }
 
-    if($TraceFound) {
+    if ($TraceFound) {
         Add-Result "HTTP TRACE" "FAIL" "Enabled"
     }
     else {
@@ -482,28 +597,28 @@ try {
         Where-Object {$_.Name -eq $HeaderName}
     }
 
-    if(HeaderExists "Strict-Transport-Security") {
+    if (HeaderExists "Strict-Transport-Security") {
         Add-Result "HSTS" "PASS" "Configured"
     }
     else {
         Add-Result "HSTS" "FAIL" "Missing"
     }
 
-    if(HeaderExists "X-Frame-Options") {
+    if (HeaderExists "X-Frame-Options") {
         Add-Result "X-Frame-Options" "PASS" "Configured"
     }
     else {
         Add-Result "X-Frame-Options" "FAIL" "Missing"
     }
 
-    if(HeaderExists "X-Content-Type-Options") {
+    if (HeaderExists "X-Content-Type-Options") {
         Add-Result "X-Content-Type-Options" "PASS" "Configured"
     }
     else {
         Add-Result "X-Content-Type-Options" "FAIL" "Missing"
     }
 
-    if(HeaderExists "Content-Security-Policy") {
+    if (HeaderExists "Content-Security-Policy") {
         Add-Result "Content-Security-Policy" "PASS" "Configured"
     }
     else {
@@ -527,15 +642,15 @@ $SIEMServices = @(
 "AzureMonitorAgent"
 )
 
-foreach($ServiceName in $SIEMServices) {
+foreach ($ServiceName in $SIEMServices) {
 
     $Service =
     Get-Service $ServiceName `
     -ErrorAction SilentlyContinue
 
-    if($Service) {
+    if ($Service) {
 
-        if($Service.Status -eq "Running") {
+        if ($Service.Status -eq "Running") {
 
             Add-Result `
             "SIEM Agent $ServiceName" `
@@ -557,9 +672,9 @@ foreach($ServiceName in $SIEMServices) {
 # ASP.NET CONFIG REVIEW
 # =====================================================
 
-Get-Website | ForEach-Object {
+$SitesToAudit | ForEach-Object {
 
-    $SiteName = $_.Name
+    $CurrentSiteName = $_.Name
     $Path = $_.PhysicalPath
 
     try {
@@ -579,17 +694,17 @@ Get-Website | ForEach-Object {
                 $Debug =
                 $Config.configuration.'system.web'.compilation.debug
 
-                if($Debug -eq "false") {
+                if ($Debug -eq "false") {
 
                     Add-Result `
-                    "$SiteName ASP.NET Debug" `
+                    "$CurrentSiteName ASP.NET Debug" `
                     "PASS" `
                     $_.FullName
                 }
-                elseif($Debug) {
+                elseif ($Debug) {
 
                     Add-Result `
-                    "$SiteName ASP.NET Debug" `
+                    "$CurrentSiteName ASP.NET Debug" `
                     "FAIL" `
                     $_.FullName
                 }
@@ -597,25 +712,25 @@ Get-Website | ForEach-Object {
                 $CustomErrors =
                 $Config.configuration.'system.web'.customErrors.mode
 
-                switch($CustomErrors) {
+                switch ($CustomErrors) {
 
                     "On" {
                         Add-Result `
-                        "$SiteName Custom Errors" `
+                        "$CurrentSiteName Custom Errors" `
                         "PASS" `
                         "On"
                     }
 
                     "RemoteOnly" {
                         Add-Result `
-                        "$SiteName Custom Errors" `
+                        "$CurrentSiteName Custom Errors" `
                         "PASS" `
                         "RemoteOnly"
                     }
 
                     "Off" {
                         Add-Result `
-                        "$SiteName Custom Errors" `
+                        "$CurrentSiteName Custom Errors" `
                         "FAIL" `
                         "Off"
                     }
@@ -644,8 +759,12 @@ $Review =
 
 $Total = $Results.Count
 
-$Compliance = :Round(
-(($Pass / $Total) * 100),2)
+$Compliance = if ($Total -gt 0) {
+    [Math]::Round((($Pass / $Total) * 100), 2)
+}
+else {
+    0
+}
 
 Write-Host ""
 Write-Host "==================================================" -ForegroundColor Cyan
@@ -669,3 +788,39 @@ Write-Host "Critical Findings" -ForegroundColor Red
 $Results |
 Where-Object Status -eq "FAIL" |
 Format-Table -AutoSize
+
+# =====================================================
+# EXPORT (optional — writes report files only, never touches IIS/Windows config)
+# =====================================================
+
+if ($ExportPath) {
+
+    try {
+
+        if (-not (Test-Path $ExportPath)) {
+            New-Item -ItemType Directory -Path $ExportPath -Force | Out-Null
+        }
+
+        $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+        $CsvPath = Join-Path $ExportPath "IISHardeningAudit-$Timestamp.csv"
+        $HtmlPath = Join-Path $ExportPath "IISHardeningAudit-$Timestamp.html"
+
+        $Results | Sort-Object Status,Control | Export-Csv -Path $CsvPath -NoTypeInformation
+
+        $Results |
+        Sort-Object Status,Control |
+        ConvertTo-Html `
+            -Title "IIS Hardening Audit Report" `
+            -PreContent "<h1>IIS Hardening Audit Report</h1><p>Compliance: $Compliance% ($Pass PASS / $Fail FAIL / $Review NEEDS REVIEW of $Total checks)</p>" |
+        Out-File -FilePath $HtmlPath
+
+        Write-Host ""
+        Write-Host "Report exported to:" -ForegroundColor Cyan
+        Write-Host "  $CsvPath"
+        Write-Host "  $HtmlPath"
+    }
+    catch {
+        Write-Host ""
+        Write-Host "Export failed: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
