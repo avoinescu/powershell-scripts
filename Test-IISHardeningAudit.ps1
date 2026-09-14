@@ -114,18 +114,23 @@ catch {
 # DEFAULT WEBSITE
 # =====================================================
 
-try {
-    $site = Get-Website "Default Web Site" -ErrorAction Stop
+if ($WebAdminAvailable) {
+    try {
+        $site = Get-Website "Default Web Site" -ErrorAction Stop
 
-    if ($site.State -eq "Stopped") {
-        Write-AuditResult "Default Web Site" "PASS" "Stopped"
+        if ($site.State -eq "Stopped") {
+            Write-AuditResult "Default Web Site" "PASS" "Stopped"
+        }
+        else {
+            Write-AuditResult "Default Web Site" "FAIL" "Running"
+        }
     }
-    else {
-        Write-AuditResult "Default Web Site" "FAIL" "Running"
+    catch {
+        Write-AuditResult "Default Web Site" "PASS" "Not Present"
     }
 }
-catch {
-    Write-AuditResult "Default Web Site" "PASS" "Not Present"
+else {
+    Write-AuditResult "Default Web Site" "NEEDS REVIEW" "WebAdministration module unavailable — cannot verify"
 }
 
 # =====================================================
@@ -332,11 +337,17 @@ catch {
 # WEBSITE AUDITS
 # =====================================================
 
-$SitesToAudit = if ($SiteName) {
-    Get-Website | Where-Object { $_.Name -in $SiteName }
+if ($WebAdminAvailable) {
+    $SitesToAudit = if ($SiteName) {
+        Get-Website | Where-Object { $_.Name -in $SiteName }
+    }
+    else {
+        Get-Website
+    }
 }
 else {
-    Get-Website
+    $SitesToAudit = @()
+    Write-AuditResult "Per-Site Checks (bindings, auth, logging, NTFS, ASP.NET config)" "NEEDS REVIEW" "WebAdministration module unavailable — no sites could be enumerated"
 }
 
 foreach ($Site in $SitesToAudit) {
@@ -550,26 +561,31 @@ foreach ($Site in $SitesToAudit) {
 # APPLICATION POOLS
 # =====================================================
 
-Get-ChildItem IIS:\AppPools |
-ForEach-Object {
+if ($WebAdminAvailable) {
+    Get-ChildItem IIS:\AppPools |
+    ForEach-Object {
 
-    $Pool = $_.Name
-    $Identity = $_.processModel.identityType
+        $Pool = $_.Name
+        $Identity = $_.processModel.identityType
 
-    if ($Identity -eq "ApplicationPoolIdentity") {
+        if ($Identity -eq "ApplicationPoolIdentity") {
 
-        Write-AuditResult `
-        "App Pool [$Pool]" `
-        "PASS" `
-        $Identity
+            Write-AuditResult `
+            "App Pool [$Pool]" `
+            "PASS" `
+            $Identity
+        }
+        else {
+
+            Write-AuditResult `
+            "App Pool [$Pool]" `
+            "FAIL" `
+            $Identity
+        }
     }
-    else {
-
-        Write-AuditResult `
-        "App Pool [$Pool]" `
-        "FAIL" `
-        $Identity
-    }
+}
+else {
+    Write-AuditResult "Application Pools" "NEEDS REVIEW" "WebAdministration module unavailable — no app pools could be enumerated"
 }
 
 # =====================================================
