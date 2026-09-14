@@ -39,7 +39,7 @@
 
 .NOTES
     Run from an elevated, 64-bit, Windows PowerShell 5.1 session (not
-    PowerShell 7 — the WebAdministration module is a legacy binary
+    PowerShell 7 - the WebAdministration module is a legacy binary
     module and its IIS: provider generally does not register cleanly
     under pwsh). Under 32-bit PowerShell on a 64-bit OS,
     HKLM:\SOFTWARE\Microsoft\InetStp can also be WOW6432Node-redirected
@@ -47,8 +47,8 @@
 
     Forced read-only: this script declares SupportsShouldProcess and
     sets $WhatIfPreference = $true itself, so any ShouldProcess-aware
-    cmdlet (Set-*/New-*/Remove-*/Enable-*/Disable-*) added here later —
-    by accident or otherwise — no-ops and reports what it would have
+    cmdlet (Set-*/New-*/Remove-*/Enable-*/Disable-*) added here later -
+    by accident or otherwise - no-ops and reports what it would have
     done instead of running. This script calls none of those today; the
     setting is defense in depth, not a fix for a real problem.
 #>
@@ -130,7 +130,7 @@ if ($WebAdminAvailable) {
     }
 }
 else {
-    Write-AuditResult "Default Web Site" "NEEDS REVIEW" "WebAdministration module unavailable — cannot verify"
+    Write-AuditResult "Default Web Site" "NEEDS REVIEW" "WebAdministration module unavailable - cannot verify"
 }
 
 # =====================================================
@@ -347,7 +347,7 @@ if ($WebAdminAvailable) {
 }
 else {
     $SitesToAudit = @()
-    Write-AuditResult "Per-Site Checks (bindings, auth, logging, NTFS, ASP.NET config)" "NEEDS REVIEW" "WebAdministration module unavailable — no sites could be enumerated"
+    Write-AuditResult "Per-Site Checks (bindings, auth, logging, NTFS, ASP.NET config)" "NEEDS REVIEW" "WebAdministration module unavailable - no sites could be enumerated"
 }
 
 foreach ($Site in $SitesToAudit) {
@@ -468,7 +468,7 @@ foreach ($Site in $SitesToAudit) {
         }
         else {
             # No assumption about whether this site should use Windows
-            # Auth (only relevant for intranet/SSO apps) — informational only.
+            # Auth (only relevant for intranet/SSO apps) - informational only.
             $State = if ($WinAuth.Value -eq $true) { "Enabled" } else { "Disabled" }
             Write-AuditResult "$CurrentSiteName Windows Auth" "INFO" $State
         }
@@ -585,7 +585,7 @@ if ($WebAdminAvailable) {
     }
 }
 else {
-    Write-AuditResult "Application Pools" "NEEDS REVIEW" "WebAdministration module unavailable — no app pools could be enumerated"
+    Write-AuditResult "Application Pools" "NEEDS REVIEW" "WebAdministration module unavailable - no app pools could be enumerated"
 }
 
 # =====================================================
@@ -831,7 +831,7 @@ Where-Object Status -eq "FAIL" |
 Format-Table -AutoSize
 
 # =====================================================
-# EXPORT (optional — writes report files only, never touches IIS/Windows config)
+# EXPORT (optional - writes report files only, never touches IIS/Windows config)
 # =====================================================
 
 if ($ExportPath) {
